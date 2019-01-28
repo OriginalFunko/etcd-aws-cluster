@@ -1,7 +1,7 @@
-#! /bin/bash
+#!/bin/bash
 pkg="etcd-aws-cluster"
 version="0.5"
-etcd_peers_file_path="/etc/sysconfig/etcd-peers"
+etcd_peers_file_path="/tmp/etcd-vars"
 export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq --raw-output .region)
 if [[ ! $AWS_DEFAULT_REGION ]]; then
     echo "$pkg: failed to get region"
@@ -117,12 +117,12 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
         for bp in $bad_peer; do
             status=0
             retry=1
-            until [[ $status = $delete_ok || $status =  $delete_gone || $retry = $retry_times ]]; do
-                status=$(curl $ETCD_CURLOPTS -f -s -w %{http_code} "$etcd_good_member_url/v2/members/$bp" -XDELETE)
+            until [[ $status = "$delete_ok" || $status = "$delete_gone" || $retry = "$retry_times" ]]; do
+                status=$(curl $ETCD_CURLOPTS -f -s -w '%{http_code}' "$etcd_good_member_url/v2/members/$bp" -XDELETE)
                 echo "$pkg: removing bad peer $bp, retry $((retry++)), return code $status."
                 sleep $wait_time
             done
-            if [[ $status != $delete_ok && $status != $delete_gone ]]; then
+            if [[ $status != "$delete_ok" && $status != "$delete_gone" ]]; then
                 echo "$pkg: ERROR: failed to remove bad peer: $bad_peer, return code $status."
                 exit 7
             else
@@ -144,12 +144,12 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
         # join an existing cluster
         status=0
         retry=1
-        until [[ $status = $add_ok || $status = $already_added || $retry = $retry_times ]]; do
-            status=$(curl $ETCD_CURLOPTS -f -s -w %{http_code} -o /dev/null -XPOST "$etcd_good_member_url/v2/members" -H "Content-Type: application/json" -d "{\"peerURLs\": [\"$peer_url\"], \"name\": \"$ec2_instance_id\"}")
+        until [[ $status = "$add_ok" || $status = "$already_added" || $retry = "$retry_times" ]]; do
+            status=$(curl $ETCD_CURLOPTS -f -s -w '%{http_code}' -o /dev/null -XPOST "$etcd_good_member_url/v2/members" -H "Content-Type: application/json" -d "{\"peerURLs\": [\"$peer_url\"], \"name\": \"$ec2_instance_id\"}")
             echo "$pkg: adding instance ID $ec2_instance_id with peer URL $peer_url, retry $((retry++)), return code $status."
             sleep $wait_time
         done
-        if [[ $status != $add_ok && $status != $already_added ]]; then
+        if [[ $status != "$add_ok" && $status != "$already_added" ]]; then
             echo "$pkg: unable to add $peer_url to the cluster: return code $status."
             exit 9
         else
