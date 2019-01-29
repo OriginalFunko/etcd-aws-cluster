@@ -2,11 +2,26 @@
 pkg="etcd-aws-cluster"
 version="0.5"
 etcd_peers_file_path="/tmp/etcd-vars"
-export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq --raw-output .region)
-if [[ ! $AWS_DEFAULT_REGION ]]; then
+
+# Functions to handle proxies correctly
+aws() {
+  http_proxy=$AWS_HTTP_PROXY \
+  HTTP_PROXY=$AWS_HTTP_PROXY \
+  https_proxy=$AWS_HTTPS_PROXY \
+  HTTPS_PROXY=$AWS_HTTPS_PROXY \
+  /usr/bin/aws "$@"
+}
+
+meta_curl() {
+  curl -s "http://169.254.169.254$1"
+}
+
+AWS_DEFAULT_REGION=$(meta_curl /latest/dynamic/instance-identity/document | jq --raw-output .region)
+if [[ -z "$AWS_DEFAULT_REGION" ]]; then
     echo "$pkg: failed to get region"
     exit 1
 fi
+export AWS_DEFAULT_REGION
 
 # Allow default client/server ports to be changed if necessary
 client_port=${ETCD_CLIENT_PORT:-2379}
@@ -29,13 +44,13 @@ if [ -f "$etcd_peers_file_path" ]; then
     exit 0
 fi
 
-ec2_instance_id=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+ec2_instance_id=$(meta_curl /latest/meta-data/instance-id)
 if [[ ! $ec2_instance_id ]]; then
     echo "$pkg: failed to get instance id from instance metadata"
     exit 2
 fi
 
-ec2_instance_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+ec2_instance_ip=$(meta_curl /latest/meta-data/local-ipv4)
 if [[ ! $ec2_instance_ip ]]; then
     echo "$pkg: failed to get instance IP address"
     exit 3
@@ -166,10 +181,10 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
     fi
 
     cat > "$etcd_peers_file_path" <<EOF
-ETCD_INITIAL_CLUSTER_STATE=existing
-ETCD_NAME=$ec2_instance_id
-ETCD_INITIAL_CLUSTER="$etcd_initial_cluster"
-ETCD_PROXY=$etcd_proxy
+export ETCD_INITIAL_CLUSTER_STATE=existing
+export ETCD_NAME=$ec2_instance_id
+export ETCD_INITIAL_CLUSTER="$etcd_initial_cluster"
+export ETCD_PROXY=$etcd_proxy
 EOF
 
 # otherwise I was already listed as a member so assume that this is a new cluster
@@ -185,9 +200,9 @@ else
     fi
 
     cat > "$etcd_peers_file_path" <<EOF
-ETCD_INITIAL_CLUSTER_STATE=new
-ETCD_NAME=$ec2_instance_id
-ETCD_INITIAL_CLUSTER="$etcd_initial_cluster"
+export ETCD_INITIAL_CLUSTER_STATE=new
+export ETCD_NAME=$ec2_instance_id
+export ETCD_INITIAL_CLUSTER="$etcd_initial_cluster"
 EOF
 fi
 

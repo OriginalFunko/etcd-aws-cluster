@@ -3,7 +3,8 @@ FROM alpine:3.8
 ARG ETCD_VER=v3.3.11
 ENV ETCD_DATA_DIR=/var/etcd/data \
     ETCD_CLIENT_PORT=2379 \
-    ETCD_SERVER_PORT=2380
+    ETCD_SERVER_PORT=2380 \
+    ETCD_DATA_DIR=/data
 
 RUN echo && \
   apk add --no-cache --no-progress \
@@ -24,8 +25,8 @@ echo
 COPY etcd-aws-cluster /etcd-aws-cluster
 COPY entrypoint.sh /entrypoint.sh
 
-# Expose volume for adding credentials
-VOLUME ["/root/.aws"]
+# Expose volumes for credentials, persistence, certs
+VOLUME ["/root/.aws", "/data", "/certs"]
 
 ENTRYPOINT ["/usr/bin/dumb-init", "/bin/bash", "/entrypoint.sh"]
 CMD ["etcd"]
