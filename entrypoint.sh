@@ -2,12 +2,23 @@
 set -e -u
 
 # Run the cluster script, then use its vars in Etcd
-bash /etcd-aws-cluster
+BASH_FLAGS=''
+if [[ ! -z "${DEBUG:-}" ]]; then
+	BASH_FLAGS='-x'
+fi
+
+bash $BASH_FLAGS /etcd-aws-cluster
 
 if [ ! -f /tmp/etcd-vars ]; then
 	echo "Startup failed!"
 	exit 1
 fi
+
+if [[ ! -z "${DEBUG:-}" ]]; then
+	echo "Produced variables:"
+	cat /tmp/etcd-vars
+fi
+
 . /tmp/etcd-vars
 
 # Run Etcd under supervisor if that is our command.
