@@ -1,0 +1,329 @@
+#!/usr/bin/env node
+// This script will parse given etcd flags, query all provided cluster members,
+// then either create a new cluster or join an existing cluster.
+
+const child = require('child_process')
+const http = require('http')
+const url = require('url')
+const os = require('os')
+let debug = false
+
+function parse_args() {
+	const args = {}
+	const env = Object.assign({}, process.env)
+	const leftovers = []
+
+	for( let i = 1; i < process.argv.length; i++ ) {
+		if( process.argv[i].startsWith('--') ) {
+			args[process.argv[i]] = process.argv[i+1]
+			i++
+		} else {
+			console.warn('Got leftover: ', process.argv[i])
+			leftovers.push(process.argv[i])
+		}
+	}
+
+	if( process.env.DEBUG ) {
+		debug = true
+	}
+
+	// Assume some defaults that are healthy for this process.
+	if( !('--name' in args) && !('ETCD_NAME' in env) ) {
+		args['--name'] == os.hostname()
+	}
+
+	if( !('--initial-advertise-peer-urls' in args) && !('ETCD_INITIAL_ADVERTISE_PEER_URLS' in env) ) {
+		args['--initial-advertise-peer-urls'] == 'http://localhost:2380,http://localhost:7001'
+	}
+
+	if( !('--advertise-client-urls' in args) && !('ETCD_ADVERTISE_CLIENT_URLS' in env) ) {
+		args['--advertise-client-urls'] == 'http://localhost:2379,http://localhost:4001'
+	}
+
+	if( debug ) {
+		console.log('Dumping all parsed args:')
+		Object.keys(args).forEach(key => {
+			console.log(`${key} | ${args[key]}`)
+		})
+
+		console.log('Dumping leftovers:')
+		leftovers.forEach(x => console.log(x))
+	}
+
+	return {leftovers, args, env}
+}
+
+function fetch(incomingOptions = {}) {
+	return new Promise((pResolve, pReject) => {
+		const options = Object.assign({
+			method: 'GET',
+			timeout: 2000,
+			headers: {},
+		}, incomingOptions)
+
+		// Ensure only one response is sent.
+		let responseSent = false
+		const resolve = (...args) => { if(responseSent) {return}; responseSent = true; pResolve(...args) }
+		const reject = (...args) => { if(responseSent) {return}; responseSent = true; pReject(...args) }
+
+		// Intercept the body option
+		let body
+		if( options.body ) {
+			body = options.body
+			delete options.body
+			if( typeof body !== 'string' ) {
+				Object.assign(options.headers, {'Content-Type': 'application/json'})
+				try {body = JSON.stringify(body)} catch(e) { reject(e) }
+			}
+		}
+
+		const request = http.request(options, res => {
+			// Pull down the response.
+			res.setEncoding('utf8')
+			let data = ''
+			res.on('data', chunk => data += chunk)
+			res.on('error', err => reject(err))
+			res.on('end', () => resolve(data))
+
+			// Handle errors as a reject.
+			if( res.statusCode > 399 ) {
+				reject(new Error(`Request failed, code ${res.statusCode}, body so far: ${data}, options:\n${JSON.stringify(options)}`))
+				// Consume stream data.
+				res.resume()
+				return
+			}
+		})
+
+		request.on('error', err => reject(err))
+		request.on('abort', () => reject(new Error('Aborted')))
+
+		if( body ) { request.write(body) }
+		request.end()
+
+		// Set a timeout if the response has not been sent in a timely fashion.
+		if( options.timeout ) {
+			setTimeout(() => {
+				if( !responseSent ) {
+					request.abort()
+				}
+			}, options.timeout + 1000)
+		}
+	})
+}
+
+function fetchJson(...args) {
+	return fetch(...args).then(response => {
+		if( response === '' ) { return Promise.resolve(null) }
+		try {
+			return Promise.resolve(JSON.parse(response))
+		} catch(e) {
+			return Promise.reject(e)
+		}
+	})
+}
+
+const checkPeer = peerName => new Promise((resolve, reject) => {
+	const parsed = peerToClientUrl(peers[peerName])
+	parsed.path = '/v2/members'
+	parsed.pathname = parsed.path
+	if( debug ) { console.log(`Check on ${peerName} URL:`, parsed.format()) }
+	fetchJson(parsed).then(response => {
+		// If we're included in the response, stop immediately and target this one
+		const thisPeerHasMe = response.members.some(member => {
+			if( myPeerUrls.some(peerUrl => member.peerURLs.includes(peerUrl)) ) {
+				return true
+			}
+
+			if( myClientUrls.some(clientUrl => member.clientURLs.includes(clientUrl)) ) {
+				return true
+			}
+			return false
+		})
+		if( debug ) { console.log(`Check on ${peerName} result: complete, hasMe: ${thisPeerHasMe}`) }
+		return resolve({hasMe: thisPeerHasMe, name: peerName, members: response.members})
+	}).catch(err => {
+		if( err.message === 'Aborted' ) {
+			if( debug ) { console.log(`Check on ${peerName} result: aborted`) }
+			return resolve(null)
+		}
+		if( debug ) { console.log(`Check on ${peerName} result: error!`, err) }
+		// Don't reject so we don't spoil other checks. This is lazy and should be done differently.
+		return resolve(err)
+	})
+})
+
+function launchEtcd(args, env) {
+	const arrayOfArgs = []
+	Object.keys(args).forEach(key => arrayOfArgs.push(key, args[key]))
+	if( debug ) { console.log('Launching Etcd, args:\n', arrayOfArgs, 'env:\n', env) }
+	try {
+		child.execFileSync('/usr/bin/etcd', arrayOfArgs, {env, stdio: 'inherit'})
+		if( debug ) { console.log('Child exited cleanly.') }
+		process.exit(0)
+	} catch(e) {
+		console.error(e, e.message, e.stack)
+		process.exit(1)
+	}
+}
+
+function peerToClientUrl(peerUrl) {
+	const parsed = url.parse(peerUrl)
+
+	// Figure out the port we should be talking to this peer on.
+	let clientPort = '2379'
+	if( parsed.port === '7001' ) {
+		clientPort = '4001'
+	} else if( parsed.port !== '2380' ) {
+		clientPort = parsed.port
+	}
+
+	if( clientPort !== parsed.port ) {
+		parsed.host = null
+		parsed.port = clientPort
+	}
+
+	return parsed
+}
+
+// Initialize signal handling-- if we're up and running, leave the cluster.
+process.on('SIGINT', () => leaveCluster('SIGINT'))
+process.on('SIGTERM', () => leaveCluster('SIGTERM'))
+
+/////////
+// Start cluster discovery
+const {args, env} = parse_args()
+
+// Sleep a random amount of time 0.3-3.3s, then launch Etcd
+const sleepTime = Math.floor((Math.random() * 3 + 0.3) * 1000)
+if( debug ) { console.log(`Going for a ${sleepTime}ms nap to avoid race conditions...`) }
+setTimeout(() => {
+	if( debug ) { console.log('Had a nap, now launching etcd...') }
+
+	// Check if we need to work around bugs.
+	const stateSetting = args['--initial-cluster-state'] || env['ETCD_INITIAL_CLUSTER_STATE']
+	if( stateSetting === 'existing' ) {
+		if( debug ) { console.log('Cluster state is existing, no need to work around simultaneous launch bugs.') }
+		launchEtcd(args, env)
+		return
+	}
+
+	const proxySetting = args['--proxy'] || env['ETCD_PROXY']
+	if( proxySetting === 'on' || proxySetting === 'readonly' ) {
+		if( debug ) { console.log('This node is a proxy, no need to work around simultaneous launch bugs.') }
+		launchEtcd(args, env)
+		return
+	}
+
+	// Parse our own provided peer and client URLs
+	const myName = args['--name'] || env['ETCD_NAME'] || os.hostname()
+	const myPeerUrls = (args['--initial-advertise-peer-urls'] || env['ETCD_INITIAL_ADVERTISE_PEER_URLS'] || '').split(',')
+	const myClientUrls = (args['--advertise-client-urls'] || env['ETCD_ADVERTISE_CLIENT_URLS'] || '').split(',')
+
+	// Parse any provided peers that aren't me.
+	let peers = {}
+	let initialCluster = args['--initial-cluster'] || env['ETCD_INITIAL_CLUSTER']
+	delete env['ETCD_INITIAL_CLUSTER']
+
+	if( initialCluster ) {
+		const kvs = initialCluster.split(',')
+		kvs.forEach(kv => {
+			const parsed = kv.split('=')
+			if( !myPeerUrls.includes(parsed[1]) ) {
+				peers[parsed[0]] = parsed[1]
+			}
+		})
+	}
+
+	if( debug ) {
+		console.log('My name:', myName)
+		console.log('Peer URLs:', myPeerUrls)
+		console.log('Client URLs:', myClientUrls)
+		console.log('Initial peers:', JSON.stringify(peers))
+	}
+
+	// Check on every peer and wait for that to resolve
+	const checks = Object.keys(peers).map(checkPeer)
+	checks.push(Promise.resolve())
+	Promise.all(checks).then(values => {
+		// Find if there is any peer that is valid, especially if we're included.
+		let targetPeer = null
+		values.forEach(value => {
+			// Ignore anything that isn't a successful check.
+			if( debug ) { console.log('Thinking about peer result: ', value) }
+
+			if( value && 'hasMe' in value ) {
+				// Use this one if we don't have one, or if this one is better.
+				if( debug ) {
+					console.log(`Considering ${value.name} as a peer:`)
+					console.log(`existing peer: `, targetPeer)
+					console.log(`this peer: `, value)
+				}
+				if( targetPeer === null || value.hasMe && !targetPeer.hasMe ) {
+					 targetPeer = value
+					 if( debug ) { console.log('-/ choosing this one!') }
+				} else {
+					if( debug ) { console.log('X not choosing this one.') }
+				}
+			} else {
+				if( debug ) { console.log('X discarded invalid result.') }
+			}
+		})
+
+		if( debug ) { console.log('Target peer selected:', targetPeer ? targetPeer : 'none') }
+
+		// Manipulate the --initial-cluster flag to force a match with only that peer.
+		if( targetPeer !== null ) {
+			args['--initial-cluster-state'] = 'existing'
+			let initialCluster = ''
+
+			// Add myself in to the initial cluster flag if it doesn't have me.
+			if( !targetPeer.hasMe ) {
+				if( debug ) { console.log('Adding myself to initial cluster:', myName, myPeerUrls) }
+				initialCluster = myPeerUrls.map(name => myName + '=' + name).join(',')
+			}
+
+			// Add all peer URLs of all discovered members.
+			initialCluster += ',' + targetPeer.members.map(member => {
+				if( debug ) { console.log('Adding to initial cluster:', member) }
+				return member.peerURLs.map(peerurl => member.name + '=' + peerurl).join(',')
+			}).join(',')
+			args['--initial-cluster'] = initialCluster
+
+			if( targetPeer.hasMe ) {
+				if( debug ) { console.log('Rejoining cluster') }
+				launchEtcd(args, env)
+				return
+			}
+
+			// Call ahead to add ourselves to the cluster, then launch.
+			const parsed = peerToClientUrl(peers[targetPeer.name])
+			parsed.path = '/v2/members'
+			parsed.pathname = parsed.path
+			if( debug ) { console.log('Adding self to cluster:', parsed.format()) }
+
+			return fetchJson(
+				Object.assign({}, parsed, {
+					method: 'POST',
+					body: {
+						name: myName,
+						peerURLs: myPeerUrls,
+					},
+				})
+			).then(response => {
+				if( 'id' in response ) {
+					if( debug ) { console.log('Success! Received ID: ',response.id) }
+					return Promise.resolve()
+				}
+				return Promise.reject('Unknown response when adding self to cluster:' + JSON.stringify(response))
+			}).then(() => launchEtcd(args, env))
+		}
+
+		// Go ahead and bootstrap a single-node cluster with just me.
+		args['--initial-cluster-state'] = 'new'
+		args['--initial-cluster'] = myPeerUrls.map(name => myName + '=' + name).join(',')
+		launchEtcd(args, env)
+	}).catch(err => {
+		console.error('Something went wrong:', err)
+		process.exit(1)
+	})
+}, sleepTime)
